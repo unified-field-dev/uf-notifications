@@ -1,0 +1,39 @@
+[package]
+name = "uf-notifications-core"
+version = "0.3.0"
+edition = "2021"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+description = "Leptos-free notification Valence models, Photon topic, and send_notification helper"
+
+[lints]
+workspace = true
+
+[dependencies]
+valence = { workspace = true }
+photon = { workspace = true, default-features = false, features = ["runtime"] }
+lepton-identity = { workspace = true }
+
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+uuid = { workspace = true, features = ["serde", "v4"] }
+chrono = { workspace = true, features = ["serde"] }
+tracing.workspace = true
+async-trait.workspace = true
+futures = { version = "0.3", default-features = false, features = ["alloc"] }
+
+[features]
+default = ["db-sqlite"]
+db-sqlite = ["valence/sqlite"]
+db-hybrid = ["valence/hybrid"]
+hydrate = []
+ssr = []
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[build-dependencies]
+valence-codegen = { workspace = true }

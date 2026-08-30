@@ -1,0 +1,10 @@
+/target
+/target-*
+
+# Leptos / Playwright host artifacts
+**/node_modules/
+**/site/
+**/end2end/test-results/
+**/end2end/playwright-report/
+**/end2end/blob-report/
+**/end2end/playwright/.cache/

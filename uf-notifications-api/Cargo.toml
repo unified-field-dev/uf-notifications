@@ -1,0 +1,72 @@
+[package]
+name = "uf-notifications-api"
+version = "0.3.0"
+edition = "2021"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+description = "Notification API with Valence-backed server functions"
+
+[lints]
+workspace = true
+
+[dependencies]
+leptos = { workspace = true }
+
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+uuid = { version = "1", features = ["serde", "v4", "js"] }
+
+uf-notifications-core = { workspace = true, optional = true }
+
+orbital-paging = { workspace = true }
+chrono = { workspace = true, optional = true }
+
+higgs = { workspace = true, optional = true }
+higgs-host = { workspace = true, optional = true }
+valence = { workspace = true, optional = true }
+
+photon = { workspace = true, optional = true }
+photon-leptos = { workspace = true, default-features = false, optional = true }
+photon-axum = { workspace = true, optional = true }
+axum = { workspace = true, optional = true, features = ["ws"] }
+futures = { version = "0.3", optional = true }
+tracing = { workspace = true, optional = true }
+
+[features]
+default = []
+# Enables `create_test_notification` and other non-production helpers.
+dev-tools = []
+hydrate = ["leptos/hydrate", "dep:photon", "dep:photon-leptos", "photon-leptos/hydrate"]
+ssr = [
+    "leptos/ssr",
+    "dep:higgs",
+    "higgs/ssr",
+    "dep:higgs-host",
+    "higgs-host/ssr",
+    "dep:valence",
+    "dep:chrono",
+    "dep:photon",
+    "photon/runtime",
+    "dep:photon-leptos",
+    "photon-leptos/ssr",
+    "dep:photon-axum",
+    "photon-axum/runtime",
+    "dep:axum",
+    "dep:futures",
+    "dep:tracing",
+    "dep:uf-notifications-core"]
+
+[dev-dependencies]
+chrono = { workspace = true }
+lepton-identity = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+valence = { workspace = true }
+uf-notifications-core = { workspace = true }
+
+[[test]]
+name = "api_ops_integration"
+required-features = ["ssr"]

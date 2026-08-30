@@ -1,0 +1,110 @@
+# PR / merge gate aligned with docs/VERIFICATION.md (core/api + mount-host).
+# Standalone checkout — UF deps resolve via git branch = main on unified-field-dev.
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 1
+  CARGO_TARGET_DIR: target-uf-notifications
+  RUST_BACKTRACE: 1
+  # Leptos workspace deps enable the `nightly` feature.
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master (pin)
+        with:
+          toolchain: nightly
+          components: rustfmt
+      - name: cargo fmt --check
+        run: >
+          cargo fmt
+          -p uf-notifications-core -p uf-notifications-api
+          -p notifications-mount-host
+          -- --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master (pin)
+        with:
+          toolchain: nightly
+          components: clippy
+      - name: cargo clippy (core + mount-host)
+        run: >
+          cargo clippy
+          -p uf-notifications-core -p notifications-mount-host
+          --all-targets -- -D warnings
+      - name: cargo clippy (api, ssr)
+        run: >
+          cargo clippy
+          -p uf-notifications-api
+          --features ssr --all-targets -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master (pin)
+        with:
+          toolchain: nightly
+      - name: cargo test (core)
+        run: |
+          cargo test -p uf-notifications-core
+          cargo test -p uf-notifications-core --test workspace_members --test product_surface --test privacy_policy_integration
+      - name: cargo test (api)
+        run: |
+          cargo test -p uf-notifications-api
+          cargo test -p uf-notifications-api --features ssr --lib
+      - name: cargo check + run (notifications-mount-host)
+        run: |
+          cargo check -p notifications-mount-host
+          cargo run -p notifications-mount-host
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master (pin)
+        with:
+          toolchain: nightly
+      - name: cargo doc (core + api, deny broken intra-doc links)
+        env:
+          RUSTDOCFLAGS: "-D rustdoc::broken-intra-doc-links"
+        run: |
+          cargo doc -p uf-notifications-core --no-deps
+          cargo doc -p uf-notifications-api --features ssr --no-deps
+
+  leptos-lints:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master (pin)
+        with:
+          toolchain: nightly
+      - name: Install cargo-dylint
+        run: |
+          cargo install cargo-dylint --locked --version 6.0.1 --force
+          cargo install dylint-link --locked --version 6.0.1 --force
+      # leptos-lints@v0.1.2 pins nightly-2025-05-14; lint hydrate UI crates with
+      # `--no-deps` where Leptos API lints apply.
+      - name: Install leptos-lints nightly toolchain
+        run: rustup toolchain install nightly-2025-05-14 --component rustc-dev,llvm-tools-preview
+      - name: cargo dylint (leptos-lints)
+        env:
+          CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
+          RUSTFLAGS: "-D warnings -Zcrate-attr=feature(stdarch_x86_avx512)"
+        run: |
+          cargo dylint --all -p uf-notifications-api --no-deps -- --features hydrate
