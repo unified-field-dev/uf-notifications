@@ -1,7 +1,7 @@
 //! Auth-scoped notification read paths (`list` / page / counts).
 
 use leptos::prelude::*;
-use orbital_paging::Page;
+use orbital_paging::{Page, PageRequest};
 
 use crate::{NotificationDto, NotificationReadFilter};
 
@@ -64,6 +64,30 @@ pub async fn get_unread_notifications_page(
     let (ctx, user_id) = require_auth_user().await?;
     let v = user_valence(&ctx)?;
     ops::unread_page_for_user(&v, user_id, offset, limit)
+        .await
+        .map_err(map_ops_err)
+}
+
+/// Get a page of unread notifications from a [`PageRequest`], continuing from its cursor.
+///
+/// Pass the previous page's [`Page::next_cursor`] as `request.cursor` (as
+/// `orbital_paging::use_paged_infinite_scroll` does) and the server resumes
+/// where that page stopped instead of re-reading every earlier row. Without a
+/// cursor, or with one from another list, it pages by `request.offset` like
+/// [`get_unread_notifications_page`]. Cursor pages return `total_count: None`.
+///
+/// # Errors
+///
+/// Same auth and store semantics as [`list_notifications`]. An unusable cursor
+/// falls back to `offset` and does not produce an error.
+#[server]
+pub async fn get_unread_notifications_by_request(
+    /// Offset, limit and cursor; sort, filter and quick search are ignored.
+    request: PageRequest,
+) -> Result<Page<NotificationDto>, ServerFnError> {
+    let (ctx, user_id) = require_auth_user().await?;
+    let v = user_valence(&ctx)?;
+    ops::unread_page_for_request(&v, user_id, &request)
         .await
         .map_err(map_ops_err)
 }
@@ -176,6 +200,35 @@ pub async fn get_notifications_page(
     let (ctx, user_id) = require_auth_user().await?;
     let v = user_valence(&ctx)?;
     ops::notifications_page_for_user(&v, user_id, offset, limit, query, read_filter)
+        .await
+        .map_err(map_ops_err)
+}
+
+/// Get a page of notifications with search and read filter from a [`PageRequest`],
+/// continuing from its cursor.
+///
+/// Same rows as [`get_notifications_page`]. Pass the previous page's
+/// [`Page::next_cursor`] as `request.cursor` and the server resumes where that
+/// page stopped. A cursor issued under another `query` or `read_filter` is
+/// ignored and the page is read from `request.offset`. Cursor pages return
+/// `total_count: None`.
+///
+/// # Errors
+///
+/// Same auth and store semantics as [`list_notifications`]. An unusable cursor
+/// falls back to `offset` and does not produce an error.
+#[server]
+pub async fn get_notifications_by_request(
+    /// Offset, limit and cursor; sort, filter and quick search are ignored.
+    request: PageRequest,
+    /// Optional free-text search matched against title and message.
+    query: Option<String>,
+    /// Read-status filter to apply.
+    read_filter: NotificationReadFilter,
+) -> Result<Page<NotificationDto>, ServerFnError> {
+    let (ctx, user_id) = require_auth_user().await?;
+    let v = user_valence(&ctx)?;
+    ops::notifications_page_for_request(&v, user_id, &request, query, read_filter)
         .await
         .map_err(map_ops_err)
 }

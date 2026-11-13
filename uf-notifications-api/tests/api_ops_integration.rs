@@ -5,11 +5,15 @@
 
 mod common;
 
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
 use common::{as_system, as_user, setup_shared_db, TEST_USER_A, TEST_USER_B};
 use uf_notifications_api::{
     list_for_user, mark_all_read_for_user, mark_read_for_user, mark_unread_for_user,
-    notification_count_for_user, notifications_page_for_user, today_count_for_user,
-    unread_count_for_user, unread_page_for_user, unread_preview_for_user, NotificationReadFilter,
+    notification_count_for_user, notifications_page_for_request, notifications_page_for_user,
+    today_count_for_user, unread_count_for_user, unread_page_for_request, unread_page_for_user,
+    unread_preview_for_user, NotificationDto, NotificationReadFilter, Page, PageRequest,
 };
 use uf_notifications_core::{send_notification, SendNotification};
 use uuid::Uuid;
@@ -297,4 +301,350 @@ async fn page_limit_clamp_happy() {
         .expect("clamp");
     assert_eq!(page.items.len(), 1);
     assert!(page.has_more);
+}
+
+/// Page size for the cursor tests.
+const PAGE: u32 = 50;
+
+/// Sums the `rows_read` field that `uf_notifications.*` spans record while it is
+/// the thread's default subscriber.
+#[derive(Default)]
+struct RowsRead {
+    total: Arc<AtomicUsize>,
+    next_id: AtomicU64,
+    spans: Mutex<std::collections::HashMap<u64, &'static tracing::Metadata<'static>>>,
+    stack: Mutex<Vec<u64>>,
+}
+
+struct SumRowsRead<'a>(&'a AtomicUsize);
+
+impl tracing::field::Visit for SumRowsRead<'_> {
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        if field.name() == "rows_read" {
+            self.0
+                .fetch_add(usize::try_from(value).unwrap(), Ordering::Relaxed);
+        }
+    }
+
+    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+}
+
+impl tracing::Subscriber for RowsRead {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        self.spans.lock().unwrap().insert(id, attrs.metadata());
+        tracing::span::Id::from_u64(id)
+    }
+
+    fn record(&self, span: &tracing::span::Id, values: &tracing::span::Record<'_>) {
+        let ours = self
+            .spans
+            .lock()
+            .unwrap()
+            .get(&span.into_u64())
+            .is_some_and(|m| m.name().starts_with("uf_notifications."));
+        if ours {
+            values.record(&mut SumRowsRead(&self.total));
+        }
+    }
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, _: &tracing::Event<'_>) {}
+
+    fn enter(&self, span: &tracing::span::Id) {
+        self.stack.lock().unwrap().push(span.into_u64());
+    }
+
+    fn exit(&self, span: &tracing::span::Id) {
+        let mut stack = self.stack.lock().unwrap();
+        if let Some(i) = stack.iter().rposition(|&id| id == span.into_u64()) {
+            stack.remove(i);
+        }
+    }
+
+    fn current_span(&self) -> tracing_core::span::Current {
+        let top = self.stack.lock().unwrap().last().copied();
+        match top.and_then(|id| Some((id, *self.spans.lock().unwrap().get(&id)?))) {
+            Some((id, meta)) => {
+                tracing_core::span::Current::new(tracing::span::Id::from_u64(id), meta)
+            }
+            None => tracing_core::span::Current::none(),
+        }
+    }
+}
+
+/// Run `fut` and return its output with the raw rows the page ops read.
+async fn rows_read_while<F: std::future::Future>(fut: F) -> (F::Output, usize) {
+    let probe = RowsRead::default();
+    let total = Arc::clone(&probe.total);
+    let _guard = tracing::subscriber::set_default(probe);
+    let out = fut.await;
+    (out, total.load(Ordering::Relaxed))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum List {
+    Unread,
+    Inbox,
+}
+
+async fn fetch_page(
+    v: &valence::Valence,
+    list: List,
+    request: &PageRequest,
+) -> Page<NotificationDto> {
+    let user = RecordId::new("user", TEST_USER_A);
+    match list {
+        List::Unread => unread_page_for_request(v, user, request)
+            .await
+            .expect("unread page"),
+        List::Inbox => {
+            notifications_page_for_request(v, user, request, None, NotificationReadFilter::All)
+                .await
+                .expect("inbox page")
+        }
+    }
+}
+
+/// What [`page_through`] saw: ids in order, pages read, and how many of
+/// those requests carried a cursor.
+struct Paged {
+    ids: Vec<Uuid>,
+    pages: usize,
+    cursor_pages: usize,
+}
+
+/// Page `list` to the end.
+///
+/// With `by_cursor`, a request after a page with `next_cursor` sends it with
+/// `offset` 0, so a cursor the server ignored would repeat page one. A page
+/// without a cursor is followed by an offset request, as the infinite-scroll
+/// hook does.
+async fn page_through(v: &valence::Valence, list: List, limit: u32, by_cursor: bool) -> Paged {
+    let mut ids = Vec::new();
+    let mut cursor_pages = 0;
+    let mut request = PageRequest::new(0, limit);
+    for pages in 1..=500 {
+        if request.cursor.is_some() {
+            cursor_pages += 1;
+        }
+        let page = fetch_page(v, list, &request).await;
+        ids.extend(page.items.iter().map(|n| n.notification_id));
+        if !page.has_more {
+            return Paged {
+                ids,
+                pages,
+                cursor_pages,
+            };
+        }
+        request = match page.next_cursor {
+            Some(cursor) if by_cursor => PageRequest::new(0, limit).with_cursor(Some(cursor)),
+            _ => PageRequest::new(u32::try_from(ids.len()).unwrap(), limit),
+        };
+    }
+    panic!("{list:?}: paging never reached the end");
+}
+
+fn page_ids(page: &Page<NotificationDto>) -> Vec<Uuid> {
+    page.items.iter().map(|n| n.notification_id).collect()
+}
+
+#[tokio::test]
+async fn cursor_pages_every_row_once_newest_first_linear_happy() {
+    const ROWS: usize = 2_500;
+    let base = setup_shared_db().await;
+    let system = as_system(&base);
+    let owner = as_user(&base, TEST_USER_A);
+
+    let mut minted = Vec::with_capacity(ROWS);
+    for i in 0..ROWS {
+        minted.push(mint(&system, TEST_USER_A, &format!("Many-{i:04}")).await);
+        if i % 50 == 0 {
+            mint(&system, TEST_USER_B, &format!("Peer-{i:04}")).await;
+        }
+    }
+    let newest_first: Vec<Uuid> = minted.iter().rev().copied().collect();
+
+    for list in [List::Unread, List::Inbox] {
+        let (by_cursor, cursor_rows) =
+            rows_read_while(page_through(&owner, list, PAGE, true)).await;
+        let pages = by_cursor.pages;
+        assert_eq!(
+            by_cursor.ids.len(),
+            ROWS,
+            "{list:?}: every row of the user's once, no peer rows"
+        );
+        assert_eq!(by_cursor.ids, newest_first, "{list:?}: newest first");
+        assert_eq!(pages, ROWS / PAGE as usize);
+        assert_eq!(
+            by_cursor.cursor_pages,
+            pages - 1,
+            "{list:?}: every page after the first resumes from a cursor"
+        );
+
+        let (by_offset, offset_rows) =
+            rows_read_while(page_through(&owner, list, PAGE, false)).await;
+        assert_eq!(
+            by_offset.ids, newest_first,
+            "{list:?}: offset paging agrees"
+        );
+
+        // Each cursor page reads its rows plus the lookahead row.
+        assert!(
+            cursor_rows <= 2 * (ROWS + pages * (PAGE as usize + 1)),
+            "{list:?}: cursor paging stays linear: {cursor_rows} raw rows over {pages} pages"
+        );
+        assert!(
+            cursor_rows * 10 < offset_rows,
+            "{list:?}: cursor paging reads far fewer raw rows ({cursor_rows}) than offset \
+             paging ({offset_rows})"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cursor_skips_pending_deletion_rows_once_edge() {
+    let base = setup_shared_db().await;
+    let system = as_system(&base);
+    let owner = as_user(&base, TEST_USER_A);
+
+    let mut minted = Vec::new();
+    for i in 0..130 {
+        minted.push(mint(&system, TEST_USER_A, &format!("Pending-{i:03}")).await);
+    }
+    // Hidden rows inside pages make the lookahead position unknown, which takes
+    // the second-read branch.
+    let pending = [3, 49, 50, 51, 120, 129];
+    for &i in &pending {
+        valence::OwnershipService::mark_pending_deletion(
+            "notification",
+            &minted[i].to_string(),
+            &system,
+        )
+        .await
+        .expect("mark pending");
+    }
+    let want: Vec<Uuid> = minted
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(i, _)| !pending.contains(i))
+        .map(|(_, id)| *id)
+        .collect();
+
+    for limit in [7, 10] {
+        for list in [List::Unread, List::Inbox] {
+            let got = page_through(&owner, list, limit, true).await;
+            assert_eq!(
+                got.ids, want,
+                "{list:?} limit {limit}: every visible row once"
+            );
+            assert_eq!(
+                got.cursor_pages,
+                got.pages - 1,
+                "{list:?} limit {limit}: a first page with a hidden row still returns a cursor"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn stale_foreign_or_garbage_cursor_falls_back_to_offset_sad() {
+    let base = setup_shared_db().await;
+    let system = as_system(&base);
+    let owner = as_user(&base, TEST_USER_A);
+    let peer = as_user(&base, TEST_USER_B);
+    let owner_id = RecordId::new("user", TEST_USER_A);
+
+    for i in 0..12 {
+        mint(&system, TEST_USER_A, &format!("Row-{i:02}")).await;
+    }
+    mint(&system, TEST_USER_B, "PeerOnly").await;
+
+    let inbox = |request: PageRequest, query: Option<String>, filter: NotificationReadFilter| {
+        let owner = owner.clone();
+        let owner_id = owner_id.clone();
+        async move {
+            notifications_page_for_request(&owner, owner_id, &request, query, filter)
+                .await
+                .expect("inbox page")
+        }
+    };
+
+    let unread_cursor = unread_page_for_request(&owner, owner_id.clone(), &PageRequest::new(0, 5))
+        .await
+        .expect("unread first page")
+        .next_cursor
+        .expect("unread cursor");
+    let first = inbox(PageRequest::new(0, 5), None, NotificationReadFilter::All).await;
+    assert_eq!(first.total_count, Some(12));
+    let inbox_cursor = first.next_cursor.clone().expect("inbox cursor");
+
+    // The inbox's own cursor is honoured and `offset` is ignored.
+    let second = inbox(
+        PageRequest::new(0, 5).with_cursor(Some(inbox_cursor.clone())),
+        None,
+        NotificationReadFilter::All,
+    )
+    .await;
+    let second_by_offset = inbox(PageRequest::new(5, 5), None, NotificationReadFilter::All).await;
+    assert_eq!(page_ids(&second), page_ids(&second_by_offset));
+    assert!(second.total_count.is_none(), "cursor pages carry no total");
+
+    // Every stale request says offset 0, so the fallback is the first page.
+    let stale = [
+        (
+            "cursor from the unread list",
+            PageRequest::new(0, 5).with_cursor(Some(unread_cursor.clone())),
+            None,
+            NotificationReadFilter::All,
+        ),
+        (
+            "another read filter",
+            PageRequest::new(0, 5).with_cursor(Some(inbox_cursor.clone())),
+            None,
+            NotificationReadFilter::Unread,
+        ),
+        (
+            "another search",
+            PageRequest::new(0, 5).with_cursor(Some(inbox_cursor.clone())),
+            Some("Row".to_string()),
+            NotificationReadFilter::All,
+        ),
+        (
+            "another page size",
+            PageRequest::new(0, 6).with_cursor(Some(inbox_cursor.clone())),
+            None,
+            NotificationReadFilter::All,
+        ),
+        (
+            "garbage",
+            PageRequest::new(0, 5).with_cursor(Some("not-a-cursor".to_string())),
+            None,
+            NotificationReadFilter::All,
+        ),
+    ];
+    for (why, request, query, filter) in stale {
+        let limit = request.limit;
+        let page = inbox(request, query.clone(), filter).await;
+        let fresh = inbox(PageRequest::new(0, limit), query, filter).await;
+        assert_eq!(page_ids(&page), page_ids(&fresh), "{why}: pages by offset");
+        assert_eq!(page.total_count, Some(12), "{why}: first offset page total");
+    }
+
+    // Another user's cursor pages that user's own rows from offset 0.
+    let peer_page = unread_page_for_request(
+        &peer,
+        RecordId::new("user", TEST_USER_B),
+        &PageRequest::new(0, 5).with_cursor(Some(unread_cursor)),
+    )
+    .await
+    .expect("peer page");
+    assert_eq!(peer_page.items.len(), 1);
+    assert_eq!(peer_page.items[0].title, "PeerOnly");
 }

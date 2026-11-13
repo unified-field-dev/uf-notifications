@@ -70,7 +70,9 @@
 //!
 //! [`get_unread_notifications_preview`] offers the ten newest unread notifications
 //! for the bell dropdown. [`get_unread_notifications_page`] supports offset/limit paging
-//! for infinite scroll in the same dropdown.
+//! for infinite scroll in the same dropdown. [`get_unread_notifications_by_request`] and
+//! [`get_notifications_by_request`] take a [`PageRequest`] and continue from its cursor
+//! ([`Page::next_cursor`] of the previous page), so deep pages don't re-read earlier rows.
 //!
 //! Prerequisites: same signed-in `ssr` context as [list notifications](#list-notifications).
 //!
@@ -265,8 +267,9 @@ mod write;
 #[cfg(feature = "ssr")]
 pub use ops::{
     list_for_user, mark_all_read_for_user, mark_read_for_user, mark_unread_for_user,
-    notification_count_for_user, notifications_page_for_user, today_count_for_user,
-    unread_count_for_user, unread_page_for_user, unread_preview_for_user, NotificationOpsError,
+    notification_count_for_user, notifications_page_for_request, notifications_page_for_user,
+    today_count_for_user, unread_count_for_user, unread_page_for_request, unread_page_for_user,
+    unread_preview_for_user, NotificationOpsError,
 };
 
 #[cfg(feature = "ssr")]
@@ -283,11 +286,11 @@ pub use uf_notifications_core::{
     SendNotificationError,
 };
 
-pub use orbital_paging::Page;
+pub use orbital_paging::{Page, PageRequest};
 pub use read::{
-    get_notification_count, get_notifications_page, get_today_count, get_unread_count,
-    get_unread_notifications_page, get_unread_notifications_preview, list_notifications,
-    subscribe_get_unread_count,
+    get_notification_count, get_notifications_by_request, get_notifications_page, get_today_count,
+    get_unread_count, get_unread_notifications_by_request, get_unread_notifications_page,
+    get_unread_notifications_preview, list_notifications, subscribe_get_unread_count,
 };
 pub use session::{
     cap_notification_count, clamp_notification_page_limit, parse_session_user_id,
